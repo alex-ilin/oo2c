@@ -45,6 +45,11 @@ VAR
   renameProcedures : Option.Boolean;
   tagSuffix : Option.String;
   autoPrefix : Option.String;
+  varTag : Option.String;
+  arrayTag : Option.String;
+  unionTag : Option.String;
+  recordTag : Option.String;
+  oocHeader : Option.Boolean;
 
 (*
 Elimination of type constructors:
@@ -94,13 +99,8 @@ BEGIN
   RETURN b.ToString();
 END QualName;
 
-PROCEDURE DeclareType(VAR t : Type.Type; mod : Type.Module);
-VAR 
-  alias, base : Type.Type;
-  buf : StringBuffer.StringBuffer;
-  name : STRING;
+PROCEDURE AdjustAliasType(VAR t : Type.Type);
 BEGIN
-  IF t.IsConstructor() THEN
     CASE t.class OF
     | Type.tPointer:
       IF Variant.array IN t.variant THEN 
@@ -113,6 +113,26 @@ BEGIN
       END;
     ELSE
     END;
+END AdjustAliasType;
+
+PROCEDURE AliasExists(t : Type.Type; mod : Type.Module) : BOOLEAN;
+VAR
+  t2 : Type.Type;
+BEGIN
+  NEW(t2);
+  t2^ := t^;
+  AdjustAliasType(t2);
+  RETURN Type.FindAliasTypeModule(mod, t2, FALSE) # NIL;
+END AliasExists;
+
+PROCEDURE DeclareType(VAR t : Type.Type; mod : Type.Module);
+VAR 
+  alias, base : Type.Type;
+  buf : StringBuffer.StringBuffer;
+  name : STRING;
+BEGIN
+  IF Type.IsTypeConstructor(t) THEN
+    AdjustAliasType(t);
     alias := Type.FindAliasTypeModule(mod, t, FALSE);
     IF alias # NIL THEN
       t := alias;
@@ -149,8 +169,10 @@ BEGIN
     IF (o # NIL) THEN
       IF (t.class = Type.tPointer) THEN
         IF ~(Variant.defined IN o.variant)
+          & mod.defaultVar.value 
           & ~Type.IsPointerBaseType(t.base.Base())
-          & mod.defaultVar.value THEN
+          & Type.IsVarBaseType(t.base.Base()) 
+          & ~AliasExists(t, mod) THEN
           o.variant := o.variant + {Variant.defined, Variant.var};
         END;
         IF (Variant.var IN o.variant)
@@ -159,7 +181,7 @@ BEGIN
         ELSE
           DeclareType(t, mod)
         END
-      ELSE
+      ELSIF t.class # Type.tEnum THEN
         DeclareType(t, mod)
       END
     ELSE
@@ -175,7 +197,13 @@ BEGIN
     EliminateConstructors(t.base, NIL, mod);
     o := t.link;
     WHILE o # NIL DO
-      EliminateConstructors(o.type, o, mod);
+(* Some type constructors are OK in parameter lists. While we COULD rewrite
+   array types, we would probably have to convert them to pointers. This is
+   because open array types are allowed in parameter lists, but not in type
+   declarations. *)
+      IF ~Type.IsAllowedParameterTypeConstructor(o.type) THEN
+        EliminateConstructors(o.type, o, mod);
+      END;
       o := o.next;
     END;
   END;
@@ -250,6 +278,14 @@ BEGIN
   END;
 END RewriteAliasesList;
 
+PROCEDURE OutTag(e : Emitter.Emitter; value : STRING);
+BEGIN
+  IF (value # NIL) & (value.length > 0) THEN
+    e.WriteObject(value);
+    e.WriteChar(' ');
+  END;
+END OutTag;
+
 PROCEDURE MapNumber(e : Emitter.Emitter;
   size : LONGINT; m1, m2, m4, m8 : Option.String);
 BEGIN
@@ -288,10 +324,11 @@ BEGIN
       name := buf.ToString();
     END;
     e.WriteObject(name);
+    e.WriteString(" ");
     IF var THEN
-      e.WriteString(" [NIL_COMPAT]");
+      OutTag(e, varTag.value);
     END;
-    e.WriteString(" : ");
+    e.WriteString(": ");
     IF var THEN
       WriteType(e, obj.type.base, mod, level);
     ELSE
@@ -332,7 +369,9 @@ BEGIN
     IF Variant.cstring IN t.variant THEN
       e.WriteString("[CSTRING] ");
     END;
-    e.WriteString("TO ARRAY OF ");
+    e.WriteString("TO ARRAY ");
+    OutTag(e, arrayTag.value);
+    e.WriteString("OF ");
     WriteType(e, t.base, mod, level);
   END;
 END WritePointerType;
@@ -340,6 +379,7 @@ END WritePointerType;
 PROCEDURE WriteArrayType(e : Emitter.Emitter; t : Type.Type; mod : Type.Module; level : INTEGER);
 BEGIN
   e.WriteString("ARRAY ");
+  OutTag(e, arrayTag.value);
   IF t.size >= 0 THEN
     e.WriteInt(t.size); e.WriteChar(" ");
   END;
@@ -348,18 +388,29 @@ BEGIN
 END WriteArrayType;
 
 PROCEDURE WriteRecordType(e : Emitter.Emitter; t : Type.Type; mod : Type.Module; level : INTEGER);
-VAR obj : Type.Object;
+VAR 
+  obj : Type.Object;
+  namelessCount : LONGINT;
 BEGIN
-  e.WriteString("RECORD"); 
+  namelessCount := 0;
+  e.WriteString("RECORD "); 
   IF t.class = Type.tUnion THEN
-    e.WriteString(" [UNION]");
+    OutTag(e, unionTag.value);
+  ELSE
+    OutTag(e, recordTag.value);
   END;
   IF t.link # NIL THEN
     e.WriteLn;
     obj := t.link;
     WHILE obj # NIL DO
       e.Indent(level+1);
-      e.WriteObject(obj.name); e.WriteString("* : ");
+      IF obj.name = NIL THEN
+        e.WriteString("nameless"); e.WriteInt(namelessCount);
+        INC(namelessCount);
+      ELSE
+        e.WriteObject(obj.name); 
+      END;
+      e.WriteString("* : ");
       WriteType(e, obj.type, mod, level+1);
       e.WriteString(";"); e.WriteLn;
       obj := obj.next;
@@ -370,6 +421,12 @@ BEGIN
   END;
   e.WriteString("END");
 END WriteRecordType;
+
+PROCEDURE WriteEnumType(e : Emitter.Emitter; t : Type.Type; mod : Type.Module; level : INTEGER);
+BEGIN
+  e.WriteObject(mapEnum.value);
+  e.WriteString(" (* enumerated type *)");
+END WriteEnumType;
 
 PROCEDURE WriteType(e : Emitter.Emitter; t : Type.Type; mod : Type.Module; level : INTEGER);
 BEGIN
@@ -398,8 +455,11 @@ BEGIN
   | Type.tArray:
     WriteArrayType(e, t, mod, level);
   | Type.tEnum:
-    e.WriteObject(mapEnum.value);
-    e.WriteString(" (* enumerated type *)");
+    IF (t.name # NIL) THEN
+      e.WriteObject(QualName(t, mod));
+    ELSE
+      WriteEnumType(e, t, mod, level);
+    END;
   | Type.tVoid:
     e.WriteObject(mapVoid.value);
   ELSE
@@ -410,8 +470,11 @@ END WriteType;
 
 PROCEDURE WriteTypeDeclaration(e : Emitter.Emitter; t : Type.Type; mod : Type.Module; level : INTEGER);
 BEGIN
-  IF t.class IN {Type.tStruct, Type.tUnion} THEN
+  CASE t.class OF 
+  | Type.tStruct, Type.tUnion:
     WriteRecordType(e, t, mod, level);
+  | Type.tEnum:
+    WriteEnumType(e, t, mod, level);
   ELSE
     WriteType(e, t, mod, level);
   END;
@@ -444,7 +507,7 @@ BEGIN
   DeclName(e, name, mod);
   (* always dereference "Name" types *)
   IF type.class = Type.tName THEN
-    WriteTypeDeclaration(e, type.base, mod, 1);
+    WriteType(e, type.base, mod, 1);
   ELSE
     WriteTypeDeclaration(e, type, mod, 1);
   END;
@@ -544,8 +607,11 @@ VAR
       IF count > 0 THEN
         e.WriteString("; ");
       END;
-      e.WriteObject(type);
-      e.WriteString(' "');
+      IF type.length > 0 THEN
+        e.WriteObject(type);
+        e.WriteChar(" ");
+      END;
+      e.WriteString('"');
       e.WriteObject(list.value.Get(i));
       e.WriteString('"');
       INC(count);
@@ -632,16 +698,21 @@ TRY
   e := NEW(Emitter.Emitter, writer);
   e.WriteString("MODULE ");
   e.WriteObject(m.outputName.value);
-  e.WriteString(' [ INTERFACE "');
-  e.WriteObject(m.interfaceType.value);
-  e.WriteString('"');
-  IF (m.linkFramework.value.size > 0) OR (m.linkLib.value.size > 0) OR (m.linkFile.value.size > 0) THEN
-    e.WriteString("; LINK ");
-    depCount := 0;
-    ListDependencies(depCount, "FRAMEWORK", m.linkFramework);
-    ListDependencies(depCount, "LIB", m.linkLib);
-    ListDependencies(depCount, "FILE", m.linkFile);
-    e.WriteString(" END");
+  depCount := 0;
+  e.WriteString(" [ ");
+  IF oocHeader.value THEN
+    e.WriteString('INTERFACE "');
+    e.WriteObject(m.interfaceType.value);
+    e.WriteString('"');
+    IF (m.linkFramework.value.size > 0) OR (m.linkLib.value.size > 0) OR (m.linkFile.value.size > 0) THEN
+      e.WriteString("; LINK ");
+      ListDependencies(depCount, "FRAMEWORK", m.linkFramework);
+      ListDependencies(depCount, "LIB", m.linkLib);
+      ListDependencies(depCount, "FILE", m.linkFile);
+      e.WriteString(" END");
+    END;
+  ELSE
+    ListDependencies(depCount, "", m.linkLib);
   END;
   e.WriteString(" ];");
   e.WriteLn;
@@ -694,8 +765,8 @@ PROCEDURE ProcessModule(m : Type.Module);
   END TranslateImportedModules;
 
 BEGIN
-  TranslateImportedModules;
   m.visited := TRUE;
+  TranslateImportedModules;
   Log.Object("Processing", m.name);
 
   seq := 0;
@@ -722,17 +793,44 @@ BEGIN
   END;
 END Translate;
 
+(* Initialise the translator to generate Component Pascal source code. *)
+
+PROCEDURE InitCP*;
+BEGIN
+  mapCharType.value := "SHORTCHAR";
+  mapUnsignedCharType.value := mapCharType.value;
+  mapShortType.value := "SHORTINT";
+  mapUnsignedShortType.value := mapUnsignedShortType.value;
+  mapLongType.value := "INTEGER";
+  mapUnsignedLongType.value := mapLongType.value;
+  mapLongLongType.value := "LONGINT";
+  mapUnsignedLongLongType.value := mapUnsignedLongLongType.value;
+  mapFloatType.value := "SHORTREAL";
+  mapDoubleType.value := "REAL";
+  mapLongDoubleType.value := "LONGDOUBLE";
+  mapPointer.value := "ANYPTR";
+  mapEnum.value := "INTEGER";
+  mapVoid.value := "";
+  varTag.value := "[nil]";
+  arrayTag.value := "[untagged]";
+  unionTag.value := "[union]";
+  recordTag.value := "[untagged]";
+  oocHeader.value := FALSE;
+END InitCP;
+
+(* Create options with defaults for OOC output *)
+
 PROCEDURE InitOptions;
 BEGIN
   options := NEW(Option.Options);
   mapCharType := options.String("MapChar", "CHAR");
-  mapUnsignedCharType := options.String("MapUnsignedChar", "CHAR");
+  mapUnsignedCharType := options.String("MapUnsignedChar", mapCharType.value);
   mapShortType := options.String("MapShort", "INTEGER");
-  mapUnsignedShortType := options.String("MapUnsignedShort", "INTEGER");
+  mapUnsignedShortType := options.String("MapUnsignedShort", mapShortType.value);
   mapLongType := options.String("MapLong", "LONGINT");
-  mapUnsignedLongType := options.String("MapUnsignedLong", "LONGINT");
+  mapUnsignedLongType := options.String("MapUnsignedLong", mapLongType.value);
   mapLongLongType := options.String("MapLongLong", "HUGEINT");
-  mapUnsignedLongLongType := options.String("MapUnsignedLongLong", "HUGEINT");
+  mapUnsignedLongLongType := options.String("MapUnsignedLongLong", mapLongLongType.value);
   mapFloatType := options.String("MapFloat", "REAL");
   mapDoubleType := options.String("MapDouble", "LONGREAL");
   mapLongDoubleType := options.String("MapLongDouble", "LONGDOUBLE");
@@ -744,7 +842,11 @@ BEGIN
   renameProcedures := options.Boolean("RenameProcedures", TRUE);
   tagSuffix := options.String("TagSuffix", "_tag");
   autoPrefix := options.String("AutoPrefix", "Auto");
-
+  varTag := options.String("VarTag", "[NIL_COMPAT]");
+  arrayTag := options.String("ArrayTag", "");
+  unionTag := options.String("UnionTag", "[UNION]");
+  recordTag := options.String("RecordTag", "");
+  oocHeader := options.Boolean("OOCHeader", TRUE);
   moduleSuffix := options.String("ModuleSuffix", "Mod");
 END InitOptions;
 
