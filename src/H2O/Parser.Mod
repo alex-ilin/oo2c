@@ -9,6 +9,7 @@ IMPORT
 
 CONST
   debugProgress = FALSE;
+  debugBind = FALSE;
 
 CONST
   (* 800: C keywords *)
@@ -23,6 +24,7 @@ CONST
   int* = 820;
   char* = 821;
   wchar* = 823;
+  int64* = 824;
   
   long* = 830;
   short* = 831;
@@ -136,10 +138,13 @@ BEGIN
   IF T.FindObjectModule(mod, {scope}, name, obj) THEN
     warn := T.AllowedRedefinition(new, obj.type);
     IF warn THEN
-      obj.type := new
+      obj.type := new;
     END;
     err.MsgParam("$0 `$1' already defined as $2", tag, name, obj.type.Base(), ~warn)
   ELSE
+    IF debugBind THEN
+      Err.String("Bind: ");Err.Object(name); Err.String(" = "); Err.Object(new.Base()); Err.Ln;
+    END;
     T.Bind(scope, name, 0, new, mod, tail);
   END;
   new.Depend(depend, mod);
@@ -217,8 +222,8 @@ PROCEDURE StartsTypeSpecifier* () : BOOLEAN;
 BEGIN
   CASE token.sym OF
   | const, volatile, cdecl, stdcall,
-    unsigned, short, long, longlong,
-    int, char, float, double, wchar,
+    unsigned, signed, short, long, longlong,
+    int, int64, char, float, double, wchar,
     enum, void, struct, union:
     RETURN TRUE;
   | Scanner.ident:
@@ -371,6 +376,7 @@ VAR
   PROCEDURE StructDecl(class : SHORTINT) : T.Type;
   VAR 
     t : T.Type;
+    oldName : BOOLEAN;
     tag : STRING;
     id : LONGINT;
 
@@ -403,6 +409,7 @@ VAR
   BEGIN
     GetSym;
     tag := NIL; id := -1;
+(*
     IF token.sym = Scanner.ident THEN
       tag := token.name;
       GetSym;
@@ -422,6 +429,39 @@ VAR
     ELSE
       err.Error("Missing tag in struct/union declaration");
       t := NewNamedType(class, "error");
+    END;
+*)
+    oldName := FALSE;
+    IF token.sym = Scanner.ident THEN
+      (* tag name given following "struct" or "union" *)
+      tag := token.name;
+      GetSym;
+      (* determine if name already exists *)
+      t := FindType(T.types, tag);
+      IF t = NIL THEN
+        (* if tag name doesn't exist, create a new type *)
+        t := NewNamedType(class, tag);
+      ELSIF t.class # class THEN
+        (* if tag name does exist, it must be the same class *)
+        err.ErrorParam("Tag `$0' already defined with different type: $1", tag, t, NIL);
+      ELSE
+        oldName := TRUE;
+      END;
+    END;
+
+    (* check for definition *)
+    IF token.sym = Scanner.lbrace THEN
+      (* if redefinition, field list must be empty *)
+      IF oldName & (t.link # NIL) THEN
+        err.ErrorParam("Type `$0' already defined a non-opaque: $1", tag, t, NIL);
+      END;
+      (* if definition without name, make nameless type *)
+      IF tag = NIL THEN
+        t := NewNamedType(class, NIL);
+      END;
+      GetSym;
+      FieldList(t);
+      Expect(Scanner.rbrace);
     END;
     RETURN t;
   END StructDecl;
@@ -451,8 +491,8 @@ compiler, but it doesn't strictly follow the language definition. *)
     | long:
       IF size = long THEN size := longlong ELSE size := long END;
       GetSym;
-    | void, char, wchar, int, float, double: 
-      type := sym; GetSym;
+    | void, char, wchar, int, int64, float, double: 
+      type := sym; GetSym; EXIT;
     | enum:
       type := enum; t := EnumDecl();
     | struct:
@@ -470,12 +510,16 @@ compiler, but it doesn't strictly follow the language definition. *)
     END; 
   END;
   IF type = 0 THEN
-    type := int; t := T.intType;
+    IF (size # 0) OR (sign # 0) THEN
+      type := int; t := T.intType;
+    ELSE
+      err.Error("Invalid type specification");
+    END;
   END;
   IF (size = short) & (type # int) OR 
      (size = long) & (type # int) & (type # double) OR
      (size = longlong) & (type # int) OR
-     (sign # 0) & (type # int) & (type # char) & (type # wchar) THEN
+     (sign # 0) & (type # int) & (type # int64) & (type # char) & (type # wchar) THEN
     err.Error("Invalid type specification");
   END;
 
@@ -495,6 +539,8 @@ compiler, but it doesn't strictly follow the language definition. *)
     | longlong:
       t := CondType(sign = unsigned, T.unsignedLongLongType, T.longLongType);
     END;
+  | int64:
+      t := CondType(sign = unsigned, T.unsignedLongLongType, T.longLongType);
   | char:
     t := CondType(sign = unsigned, T.unsignedCharType, T.charType);
   | wchar:
@@ -968,7 +1014,6 @@ VAR
         GetSym;
         IF StartsTypeSpecifier() THEN
           (* type cast *)
-          GetSym;
           name := NIL;
           t := Declarator(name, TypeSpecifier());
           Expect(Scanner.rbracket);
@@ -1585,7 +1630,7 @@ BEGIN
   Scanner.AddKeyWord(keyWords,"double", double);
   Scanner.AddKeyWord(keyWords,"char", char); 
   Scanner.AddKeyWord(keyWords,"int", int); 
-  Scanner.AddKeyWord(keyWords,"__int64", longlong); 
+  Scanner.AddKeyWord(keyWords,"__int64", int64); 
   Scanner.AddKeyWord(keyWords,"wchar_t", wchar);
   Scanner.AddKeyWord(keyWords,"long", long); 
   Scanner.AddKeyWord(keyWords,"short", short);
